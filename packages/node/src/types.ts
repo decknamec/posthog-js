@@ -154,6 +154,13 @@ export type FeatureFlagCondition = {
 
 export type FeatureFlagBucketingIdentifier = 'distinct_id' | 'device_id' | '' | null
 
+/**
+ * Where a feature flag is allowed to be evaluated, as configured in PostHog's
+ * "Evaluation runtime" setting. `all` is the default for flags created before the
+ * setting existed and for flags left on "Both client and server".
+ */
+export type FeatureFlagEvaluationRuntime = 'all' | 'client' | 'server'
+
 export type BeforeSendFn = (event: EventMessage | null) => EventMessage | null
 
 export type PostHogOptions = Omit<PostHogCoreOptions, 'before_send' | 'flushInterval' | 'maxQueueSize'> & {
@@ -381,6 +388,13 @@ export type PostHogFeatureFlag = {
   experiment_set: number[]
   /** Whether the flag is linked to an experiment. Absent when the server does not report it. */
   has_experiment?: boolean
+  /**
+   * Where the flag is allowed to be evaluated, as configured in PostHog. The local evaluation
+   * poller keeps a flag only when this is `server`, `all`, or absent, mirroring the remote
+   * `/flags` path, which excludes `client` flags from server SDK requests. Absent when the
+   * server does not report it.
+   */
+  evaluation_runtime?: FeatureFlagEvaluationRuntime
   /**
    * Evaluation context tags set on the flag. The local evaluation poller keeps a flag only
    * when this list is empty or shares at least one entry with the SDK's `evaluationContexts`.

@@ -3209,6 +3209,243 @@ describe('local evaluation with evaluation contexts', () => {
   })
 })
 
+describe('local evaluation with evaluation runtime', () => {
+  let posthog: PostHog
+
+  vi.useFakeTimers()
+
+  afterEach(async () => {
+    await posthog.shutdown()
+  })
+
+  const flags = {
+    flags: [
+      {
+        id: 1,
+        name: 'Server Feature',
+        key: 'server-flag',
+        active: true,
+        evaluation_runtime: 'server',
+        filters: { groups: [{ properties: [], rollout_percentage: 100 }] },
+      },
+      {
+        id: 2,
+        name: 'Client Feature',
+        key: 'client-flag',
+        active: true,
+        evaluation_runtime: 'client',
+        filters: { groups: [{ properties: [], rollout_percentage: 100 }] },
+      },
+      {
+        id: 3,
+        name: 'Both Feature',
+        key: 'all-flag',
+        active: true,
+        evaluation_runtime: 'all',
+        filters: { groups: [{ properties: [], rollout_percentage: 100 }] },
+      },
+      {
+        id: 4,
+        name: 'Feature without a runtime',
+        key: 'no-runtime-flag',
+        active: true,
+        filters: { groups: [{ properties: [], rollout_percentage: 100 }] },
+      },
+    ],
+  }
+
+  it('drops client-only flags and keeps server, all, and unset runtimes', async () => {
+    mockedFetch.mockImplementation(apiImplementation({ localFlags: flags }))
+
+    posthog = new PostHog('TEST_API_KEY', {
+      host: 'http://example.com',
+      personalApiKey: 'TEST_PERSONAL_API_KEY',
+      strictLocalEvaluation: true,
+      ...posthogImmediateResolveOptions,
+    })
+
+    // Matches what `/flags` returns for this SDK, which excludes `client` flags from server
+    // SDK requests rather than evaluating them.
+    expect(await posthog.getAllFlags('distinct-id', { onlyEvaluateLocally: true })).toEqual({
+      'server-flag': true,
+      'all-flag': true,
+      'no-runtime-flag': true,
+    })
+    expect(mockedFetch).toHaveBeenCalledWith(...anyLocalEvalCall)
+  })
+
+  // The property this locks down: the poller's keep/drop decision matches what `/flags` would
+  // decide for this SDK, for every runtime value the wire can carry — not just the three the
+  // union type names. The server resolves runtime strings with `eq_ignore_ascii_case` and treats
+  // anything it doesn't recognize as `all` (`EvaluationRuntime::from`), so an exact `!== 'client'`
+  // comparison silently diverges on casing.
+  it.each([
+    // [description, wire value, kept by /flags for a server-runtime request]
+    ['canonical client', 'client', false],
+    ['upper-case client', 'CLIENT', false],
+    ['title-case client', 'Client', false],
+    ['mixed-case client', 'cLiEnT', false],
+    ['canonical server', 'server', true],
+    ['upper-case server', 'SERVER', true],
+    ['canonical all', 'all', true],
+    ['title-case all', 'All', true],
+    ['unrecognized runtime', 'future-runtime', true],
+    ['empty string', '', true],
+    // Not equal to `client` under ASCII case folding, so the server keeps it and so must we.
+    ['padded client', ' client ', true],
+    ['client-like prefix', 'clients', true],
+    ['non-ascii lookalike', 'CLİENT', true],
+    ['null runtime', null, true],
+    ['absent runtime', undefined, true],
+  ])('matches the server for a %s', async (_label, runtime, keptByServer) => {
+    const definition: Record<string, any> = {
+      id: 1,
+      name: 'Probe',
+      key: 'probe-flag',
+      active: true,
+      filters: { groups: [{ properties: [], rollout_percentage: 100 }] },
+    }
+    if (runtime !== undefined) {
+      definition.evaluation_runtime = runtime
+    }
+    mockedFetch.mockImplementation(apiImplementation({ localFlags: { flags: [definition] } }))
+
+    posthog = new PostHog('TEST_API_KEY', {
+      host: 'http://example.com',
+      personalApiKey: 'TEST_PERSONAL_API_KEY',
+      strictLocalEvaluation: true,
+      ...posthogImmediateResolveOptions,
+    })
+
+    expect(await posthog.getAllFlags('distinct-id', { onlyEvaluateLocally: true })).toEqual(
+      keptByServer ? { 'probe-flag': true } : {}
+    )
+  })
+
+  it('leaves a client-only flag unresolved for getFeatureFlag', async () => {
+    mockedFetch.mockImplementation(apiImplementation({ localFlags: flags }))
+
+    posthog = new PostHog('TEST_API_KEY', {
+      host: 'http://example.com',
+      personalApiKey: 'TEST_PERSONAL_API_KEY',
+      strictLocalEvaluation: true,
+      ...posthogImmediateResolveOptions,
+    })
+
+    expect(await posthog.getFeatureFlag('server-flag', 'distinct-id', { onlyEvaluateLocally: true })).toBe(true)
+    expect(await posthog.getFeatureFlag('client-flag', 'distinct-id', { onlyEvaluateLocally: true })).toBeUndefined()
+  })
+
+  it('applies runtime and context filtering together', async () => {
+    const mixedFlags = {
+      flags: [
+        {
+          id: 1,
+          name: 'Server flag in the backend context',
+          key: 'server-backend-flag',
+          active: true,
+          evaluation_runtime: 'server',
+          evaluation_contexts: ['backend'],
+          filters: { groups: [{ properties: [], rollout_percentage: 100 }] },
+        },
+        {
+          id: 2,
+          name: 'Server flag in another context',
+          key: 'server-worker-flag',
+          active: true,
+          evaluation_runtime: 'server',
+          evaluation_contexts: ['worker'],
+          filters: { groups: [{ properties: [], rollout_percentage: 100 }] },
+        },
+        {
+          id: 3,
+          name: 'Client flag in the backend context',
+          key: 'client-backend-flag',
+          active: true,
+          evaluation_runtime: 'client',
+          evaluation_contexts: ['backend'],
+          filters: { groups: [{ properties: [], rollout_percentage: 100 }] },
+        },
+      ],
+    }
+    mockedFetch.mockImplementation(apiImplementation({ localFlags: mixedFlags }))
+
+    posthog = new PostHog('TEST_API_KEY', {
+      host: 'http://example.com',
+      personalApiKey: 'TEST_PERSONAL_API_KEY',
+      evaluationContexts: ['backend'],
+      strictLocalEvaluation: true,
+      ...posthogImmediateResolveOptions,
+    })
+
+    expect(await posthog.getAllFlags('distinct-id', { onlyEvaluateLocally: true })).toEqual({
+      'server-backend-flag': true,
+    })
+  })
+
+  it('treats a runtime-filtered dependency as false in strict local evaluation', async () => {
+    const dependencyFlags = {
+      flags: [
+        {
+          id: 1,
+          name: 'Client Feature',
+          key: 'client-flag',
+          active: true,
+          evaluation_runtime: 'client',
+          filters: { groups: [{ properties: [], rollout_percentage: 100 }] },
+        },
+        {
+          id: 2,
+          name: 'Depends on client flag being false',
+          key: 'depends-expects-false',
+          active: true,
+          evaluation_runtime: 'server',
+          filters: {
+            groups: [
+              {
+                properties: [{ key: 'client-flag', value: false, type: 'flag', dependency_chain: ['client-flag'] }],
+                rollout_percentage: 100,
+              },
+            ],
+          },
+        },
+        {
+          id: 3,
+          name: 'Depends on client flag being true',
+          key: 'depends-expects-true',
+          active: true,
+          evaluation_runtime: 'server',
+          filters: {
+            groups: [
+              {
+                properties: [{ key: 'client-flag', value: true, type: 'flag', dependency_chain: ['client-flag'] }],
+                rollout_percentage: 100,
+              },
+            ],
+          },
+        },
+      ],
+    }
+    mockedFetch.mockImplementation(apiImplementation({ localFlags: dependencyFlags }))
+
+    posthog = new PostHog('TEST_API_KEY', {
+      host: 'http://example.com',
+      personalApiKey: 'TEST_PERSONAL_API_KEY',
+      strictLocalEvaluation: true,
+      ...posthogImmediateResolveOptions,
+    })
+
+    // client-flag is dropped, so its dependents resolve against a seeded `false` value rather
+    // than throwing "Missing flag dependency".
+    expect(await posthog.getFeatureFlag('depends-expects-false', 'distinct-id', { onlyEvaluateLocally: true })).toBe(
+      true
+    )
+    expect(await posthog.getFeatureFlag('depends-expects-true', 'distinct-id', { onlyEvaluateLocally: true })).toBe(
+      false
+    )
+  })
+})
+
 describe('getFeatureFlag', () => {
   it('should capture $feature_flag_called when called, but not add all cached flags', async () => {
     const flags = {
@@ -7766,6 +8003,50 @@ describe('experience continuity warning', () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('included-cont-flag'))
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('1 flag(s)'))
     // The context-excluded flag never takes the server-fallback path here, so it must not be named.
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('excluded-cont-flag'))
+  })
+
+  it('does not warn about continuity flags excluded by evaluation runtime', async () => {
+    const flags = {
+      flags: [
+        {
+          id: 1,
+          name: 'Included Continuity Flag',
+          key: 'included-cont-flag',
+          active: true,
+          ensure_experience_continuity: true,
+          evaluation_runtime: 'server',
+          filters: {
+            groups: [{ properties: [], rollout_percentage: 100 }],
+          },
+        },
+        {
+          id: 2,
+          name: 'Excluded Continuity Flag',
+          key: 'excluded-cont-flag',
+          active: true,
+          ensure_experience_continuity: true,
+          evaluation_runtime: 'client',
+          filters: {
+            groups: [{ properties: [], rollout_percentage: 100 }],
+          },
+        },
+      ],
+    }
+    mockedFetch.mockImplementation(apiImplementation({ localFlags: flags }))
+
+    posthog = new PostHog('TEST_API_KEY', {
+      host: 'http://example.com',
+      personalApiKey: 'TEST_PERSONAL_API_KEY',
+      ...posthogImmediateResolveOptions,
+    })
+
+    await vi.runOnlyPendingTimersAsync()
+
+    // Only the kept flag is evaluated locally, so only it should appear in the warning.
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('included-cont-flag'))
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('1 flag(s)'))
+    // The runtime-excluded flag never takes the server-fallback path here, so it must not be named.
     expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('excluded-cont-flag'))
   })
 })

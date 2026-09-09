@@ -114,9 +114,10 @@ class FeatureFlagsPoller {
   private flagDefinitionsLoadedAt?: number
   private onMinimalFlagCalledEvents?: (enabled: boolean) => void
   private evaluationContexts?: readonly string[]
-  // Keys present in the definitions payload but dropped by evaluation-context filtering. A kept
-  // flag may still depend on one of these; the remote evaluator pre-seeds such flags as false,
-  // so dependency evaluation mirrors that instead of throwing "Missing flag dependency".
+  // Keys present in the definitions payload but dropped by evaluation-runtime or
+  // evaluation-context filtering. A kept flag may still depend on one of these; the remote
+  // evaluator pre-seeds such flags as false, so dependency evaluation mirrors that instead of
+  // throwing "Missing flag dependency".
   private filteredOutFlagKeys: Set<string> = new Set()
 
   constructor({
@@ -429,8 +430,8 @@ class FeatureFlagsPoller {
         const depFlag = this.featureFlagsByKey[depFlagKey]
         if (!depFlag) {
           if (this.filteredOutFlagKeys.has(depFlagKey)) {
-            // Dependency was dropped by evaluation-context filtering, not genuinely missing. The
-            // remote evaluator pre-seeds context-filtered flags as false so conditions like
+            // Dependency was dropped by runtime or context filtering, not genuinely missing. The
+            // remote evaluator pre-seeds filtered-out flags as false so conditions like
             // `flag_evaluates_to=false` still match; do the same here instead of throwing.
             evaluationCache[depFlagKey] = false
           } else {
@@ -645,8 +646,20 @@ class FeatureFlagsPoller {
   }
 
   /**
-   * Updates the internal flag state with the provided flag data.
+   * Keeps only the flags this SDK instance is allowed to evaluate for its runtime, mirroring
+   * the remote `/flags` evaluation path (`collect_excluded_by_runtime`). posthog-node and
+   * posthog-edge are server runtimes, so a flag is kept unless it is marked `client`. Flags
+   * with no runtime, or with `all`, are always kept.
    */
+  private filterFlagsByEvaluationRuntime(flags: PostHogFeatureFlag[]): PostHogFeatureFlag[] {
+    // Compare case-insensitively: the server resolves runtime strings with
+    // `eq_ignore_ascii_case` (`EvaluationRuntime::from`), so a definition carrying `Client` or
+    // `CLIENT` is excluded remotely and has to be excluded here too. A value the server doesn't
+    // recognize falls back to `all` there, so anything that isn't `client` is kept, including a
+    // flag with no runtime at all.
+    return flags.filter((flag) => flag.evaluation_runtime?.toLowerCase() !== 'client')
+  }
+
   /**
    * Keeps only the flags this SDK instance should evaluate for its configured evaluation
    * contexts. A flag with no evaluation contexts is always kept. A flag with contexts is
@@ -671,15 +684,19 @@ class FeatureFlagsPoller {
     })
   }
 
+  /**
+   * Updates the internal flag state with the provided flag data.
+   */
   private updateFlagState(flagData: FlagDefinitionCacheData): void {
-    const flags = this.filterFlagsByEvaluationContexts(flagData.flags)
+    const flags = this.filterFlagsByEvaluationContexts(this.filterFlagsByEvaluationRuntime(flagData.flags))
     this.featureFlags = flags
     this.featureFlagsByKey = flags.reduce<Record<string, PostHogFeatureFlag>>(
       (acc, curr) => ((acc[curr.key] = curr), acc),
       {}
     )
-    // Remember which definitions were dropped by context filtering so dependency evaluation can
-    // treat them as false (mirroring the remote path) rather than as genuinely missing.
+    // Remember which definitions were dropped by runtime or context filtering so dependency
+    // evaluation can treat them as false (mirroring the remote path) rather than as genuinely
+    // missing.
     const keptKeys = new Set(flags.map((flag) => flag.key))
     this.filteredOutFlagKeys = new Set(flagData.flags.filter((flag) => !keptKeys.has(flag.key)).map((flag) => flag.key))
     this.groupTypeMapping = flagData.groupTypeMapping
